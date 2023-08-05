@@ -1,0 +1,92 @@
+- name: Setup WireGuard
+  hosts: all
+  vars:
+    # WireGuard Server Private Key
+    # Generate with: wg genkey
+    wg_priv_key: "{{ undef(hint='WireGuard Server Private Key') }}"
+
+    # WireGuard IPv4 Range
+    wg_ipv4_range: "10.0.42.0/24"
+
+    # WireGuard Port
+    wg_port: "33099"
+
+    # Allowed peers
+    # Dictionary of the form: Peer Public Key -> IP
+    # ie: base64_public_key: "10.0.42.3"
+    wg_peers: "{{ undef(hint='WireGuard Peers') }}"
+
+    # WireGuard server interfaces
+    wg_interface: "wg0"
+    wg_public_interface: "eth0"
+    
+  tasks:
+    - name: Install WireGuard
+      become: yes
+      apt:
+        name:
+          - wireguard
+        update_cache: true
+      # Often blocked by unattended-upgrades, so retry on failures
+      register: apt_status
+      until: apt_status is success
+      delay: 6
+      retries: 10
+
+    - name: Enable UFW
+      ufw:
+        state: enabled
+
+    - name: UFW - Ratelimit SSH
+      ufw:
+        rule: limit
+        port: ssh
+        proto: tcp
+
+    - name: UFW - Allow WireGuard Connections
+      ufw:
+        rule: allow
+        port: "{{ wg_port }}"
+        proto: udp
+
+    - name: Configure WireGuard
+      become: yes
+      no_log: True
+      copy:
+        content: |
+          [Interface]
+          PrivateKey = {{ wg_priv_key }}
+          Address = {{ wg_ipv4_range }}
+          ListenPort = {{ wg_port }}
+          SaveConfig = true
+
+          PostUp = ufw route allow in on {{ wg_interface }} out on {{ wg_public_interface }}
+          PostUp = iptables -t nat -I POSTROUTING -o {{ wg_public_interface }} -j MASQUERADE
+          PreDown = ufw route delete allow in on {{ wg_interface }} out on {{ wg_public_interface }}
+          PreDown = iptables -t nat -D POSTROUTING -o {{ wg_public_interface }} -j MASQUERADE
+        dest: /etc/wireguard/{{ wg_interface }}.conf
+
+    - name: Enable IP Forwarding
+      become: yes
+      lineinfile:
+        path: /etc/sysctl.conf
+        regexp: ^net\.ipv4\.ip_forward=
+        line: net.ipv4.ip_forward=1
+
+    - name: Apply sysctl Settings
+      become: yes
+      command: sysctl -p
+
+    - name: Enable the WireGuard Service
+      become: yes
+      command: systemctl enable wg-quick@{{ wg_interface }}.service
+
+    - name: Start the WireGuard Service
+      become: yes
+      command: systemctl start wg-quick@{{ wg_interface }}.service
+
+    - name: Add WireGuard Peers
+      become: yes
+      loop: "{{ wg_peers | dict2items }}"
+      command: wg set {{ wg_interface }} peer {{ item.key }} allowed-ips {{ item.value }}
+        
